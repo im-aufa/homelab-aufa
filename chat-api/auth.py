@@ -1,85 +1,65 @@
 import os
-import httpx
-from fastapi import HTTPException, Security
+import secrets
+from datetime import datetime, timedelta, timezone
+from fastapi import HTTPException, Security, Depends
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from jose import jwt, jwk
-from jose.exceptions import JWTError, ExpiredSignatureError, JWTClaimsError
+import hmac
+import hashlib
+import base64
+import json
 
-# --- Auth0 Configuration ---
-# These values will be pulled from environment variables.
-# You need to set these in your .env file and your deployment environment.
-AUTH0_DOMAIN = os.getenv("AUTH0_DOMAIN")
-# This is the 'Identifier' of your API in the Auth0 Dashboard.
-API_AUDIENCE = os.getenv("API_AUDIENCE")
-ALGORITHMS = ["RS256"]
+# --- Local Auth Config (from environment) ---
+LOCAL_SECRET_KEY = os.getenv("LOCAL_SECRET_KEY", "change-me-please-use-a-random-secret")
+LOCAL_USERNAME = os.getenv("LOCAL_USERNAME", "admin")
+LOCAL_PASSWORD = os.getenv("LOCAL_PASSWORD", "password123")
 
-# A dictionary to cache the JWKS (JSON Web Key Set)
-jwks = {}
+TOKEN_EXPIRE_HOURS = 24
 
-class VerifyToken:
-    """Does all the token verification using PyJWT"""
+security = HTTPBearer()
 
-    def __init__(self):
-        self.auth0_domain = AUTH0_DOMAIN
-        self.api_audience = API_AUDIENCE
-        self.algorithms = ALGORITHMS
-        self.jwks_url = f"https://{self.auth0_domain}/.well-known/jwks.json"
+# ---------------------------------------------------------------------------
+# Minimal "signed token" implementation — no third-party JWT library needed.
+# Format:  base64(header).base64(payload).base64(HMAC-SHA256 signature)
+# ---------------------------------------------------------------------------
 
-    async def get_jwks(self):
-        global jwks
-        if not jwks:
-            async with httpx.AsyncClient() as client:
-                response = await client.get(self.jwks_url)
-                response.raise_for_status()
-                jwks = response.json()
-        return jwks
+def _b64_encode(data: dict) -> str:
+    return base64.urlsafe_b64encode(json.dumps(data, separators=(",", ":")).encode()).decode().rstrip("=")
 
-    async def verify(self, token: HTTPAuthorizationCredentials = Security(HTTPBearer())):
-        if token is None:
-            raise HTTPException(status_code=401, detail="Unauthorized: No token provided")
-        
-        try:
-            unverified_header = jwt.get_unverified_header(token.credentials)
-        except JWTError:
-            raise HTTPException(status_code=401, detail="Unauthorized: Invalid token header")
+def _b64_decode(s: str) -> dict:
+    # Restore padding
+    padding = 4 - len(s) % 4
+    s += "=" * (padding % 4)
+    return json.loads(base64.urlsafe_b64decode(s))
 
-        kid = unverified_header.get("kid")
-        if not kid:
-            raise HTTPException(status_code=401, detail="Unauthorized: Missing 'kid' in token header")
+def _sign(header_b64: str, payload_b64: str) -> str:
+    msg = f"{header_b64}.{payload_b64}".encode()
+    sig = hmac.new(LOCAL_SECRET_KEY.encode(), msg, hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(sig).decode().rstrip("=")
 
-        signing_key = None
-        jwks_keys = await self.get_jwks()
-        for key in jwks_keys["keys"]:
-            if key["kid"] == kid:
-                signing_key = jwk.construct(key, algorithm=self.algorithms[0])
-                break
-        
-        if not signing_key:
-            raise HTTPException(status_code=401, detail="Unauthorized: Could not find appropriate signing key")
+def create_token(username: str) -> str:
+    header = _b64_encode({"alg": "HS256", "typ": "JWT"})
+    exp = (datetime.now(timezone.utc) + timedelta(hours=TOKEN_EXPIRE_HOURS)).timestamp()
+    payload = _b64_encode({"sub": username, "exp": exp})
+    signature = _sign(header, payload)
+    return f"{header}.{payload}.{signature}"
 
-        try:
-            payload = jwt.decode(
-                token.credentials,
-                signing_key.to_pem(),
-                algorithms=self.algorithms,
-                audience=self.api_audience,
-                issuer=f"https://{self.auth0_domain}/"
-            )
-            return payload
-        except ExpiredSignatureError:
-            raise HTTPException(status_code=401, detail="Token has expired")
-        except JWTClaimsError as e:
-            raise HTTPException(status_code=401, detail=f"Invalid claims: {e}")
-        except JWTError as e:
-            raise HTTPException(status_code=401, detail=f"Token validation error: {e}")
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
+def verify_token(token: str) -> dict:
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            raise ValueError("Malformed token")
+        header_b64, payload_b64, sig_b64 = parts
+        expected_sig = _sign(header_b64, payload_b64)
+        if not hmac.compare_digest(sig_b64, expected_sig):
+            raise ValueError("Invalid signature")
+        payload = _b64_decode(payload_b64)
+        if datetime.now(timezone.utc).timestamp() > payload["exp"]:
+            raise ValueError("Token expired")
+        return payload
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
 
-# Create a single instance of the verifier
-token_verifier = VerifyToken()
-
-# Dependency to be used in FastAPI endpoints
-def get_current_user(token: dict = Security(token_verifier.verify)):
-    # You can add more logic here, e.g., fetching user details from your database
-    # based on the 'sub' (subject/user ID) claim in the token.
-    return token
+def get_current_user(credentials: HTTPAuthorizationCredentials = Security(security)) -> dict:
+    return verify_token(credentials.credentials)

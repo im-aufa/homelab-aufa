@@ -28,7 +28,6 @@ RUN pip install --no-cache /wheels/*
 # Copy the application code.
 COPY app.py .
 COPY auth.py .
-COPY credentials.json .
 
 EXPOSE 8000
 

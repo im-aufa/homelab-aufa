@@ -6,33 +6,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Aufa Ilham - Portfolio</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
-    <script src="https://cdn.jsdelivr.net/npm/@auth0/auth0-spa-js@2.1.0/dist/auth0-spa-js.production.js"
-        onerror="loadAuth0Fallback()"></script>
-    <script>
-        function loadAuth0Fallback() {
-            console.log('Primary Auth0 CDN failed, trying fallback...');
-            const script = document.createElement('script');
-            script.src = 'https://unpkg.com/@auth0/auth0-spa-js@2.1.0/dist/auth0-spa-js.production.js';
-            script.onload = () => console.log('Auth0 loaded from fallback CDN');
-            script.onerror = () => console.error('All Auth0 CDNs failed');
-            document.head.appendChild(script);
-        }
-    </script>
-    <script>
-        // Wait for Auth0 to be available
-        window.auth0Ready = new Promise((resolve) => {
-            if (window.auth0) {
-                resolve();
-            } else {
-                const checkAuth0 = setInterval(() => {
-                    if (window.auth0) {
-                        clearInterval(checkAuth0);
-                        resolve();
-                    }
-                }, 50);
-            }
-        });
-    </script>
+
     <style>
         /* Modern CSS Reset */
         *,
@@ -742,33 +716,34 @@
         </form>
     </div>
 
+    <!-- Login Modal -->
+    <div id="loginModal" style="display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 2000; align-items: center; justify-content: center;">
+        <div style="background: var(--bg-off); border-radius: var(--radius-md); padding: var(--space-5); width: 100%; max-width: 360px; box-shadow: 0 20px 40px rgba(0,0,0,0.2);">
+            <h3 style="margin-top: 0; margin-bottom: var(--space-3);">Sign In</h3>
+            <form id="loginForm">
+                <div style="margin-bottom: var(--space-2);">
+                    <label for="loginUsername" style="display: block; margin-bottom: 4px; font-size: var(--font-size-sm); font-weight: 500;">Username</label>
+                    <input type="text" id="loginUsername" name="username" autocomplete="username" required
+                        style="width: 100%; padding: 8px 12px; border: 1px solid var(--border-color); border-radius: var(--radius-sm); font-size: var(--font-size-base);">
+                </div>
+                <div style="margin-bottom: var(--space-3);">
+                    <label for="loginPassword" style="display: block; margin-bottom: 4px; font-size: var(--font-size-sm); font-weight: 500;">Password</label>
+                    <input type="password" id="loginPassword" name="password" autocomplete="current-password" required
+                        style="width: 100%; padding: 8px 12px; border: 1px solid var(--border-color); border-radius: var(--radius-sm); font-size: var(--font-size-base);">
+                </div>
+                <p id="loginError" style="color: #e53e3e; font-size: var(--font-size-sm); margin-bottom: var(--space-2); min-height: 1.2em;"></p>
+                <button type="submit" style="width: 100%; padding: var(--space-2); background: var(--primary); color: white; border: none; border-radius: var(--radius-sm); font-size: var(--font-size-base); font-weight: 500; cursor: pointer;">
+                    Sign In
+                </button>
+            </form>
+        </div>
+    </div>
+
     <footer class="container text-center mt-8">
         <p>© 2025 Muhammad Aufa Ilham Muharam</p>
     </footer>
 
     <script src="/script.js"></script>
-    <script>
-        function adjustMessageWidth(message) {
-            const text = message.textContent;
-            const length = text.length;
-
-            message.classList.remove('short', 'medium', 'long');
-
-            if (length < 20) {
-                message.classList.add('short');
-            } else if (length < 100) {
-                message.classList.add('medium');
-            } else {
-                message.classList.add('long');
-            }
-        }
-
-        // Call this function when adding new messages
-        document.addEventListener('DOMContentLoaded', function () {
-            const messages = document.querySelectorAll('.message');
-            messages.forEach(adjustMessageWidth);
-        });
-    </script>
 </body>
 
 </html>

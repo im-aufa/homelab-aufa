@@ -1,87 +1,37 @@
-version: "3.8"
 services:
-  traefik:
-    image: traefik:v3.1
-    ports:
-      - "443:443"
-      - "8080:8080"
-    volumes:
-      - letsencrypt:/letsencrypt
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-    command:
-      - "--api.insecure=true" # Set to false later for production
-      - "--providers.docker=true"
-      - "--providers.docker.exposedbydefault=false"
-      - "--entrypoints.websecure.address=:443"
-      - "--certificatesresolvers.le.acme.tlschallenge=true"
-      - "--certificatesresolvers.le.acme.email=im.aufa.ai@gmail.com"
-      - "--certificatesresolvers.le.acme.storage=/letsencrypt/acme.json"
-    restart: unless-stopped
-    networks:
-      - web
-
-  portfolio:
-    build:
-      context: ./portfolio-site
-      dockerfile: dockerfile
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.portfolio.rule=Host(`aufaim.com`)"
-      - "traefik.http.routers.portfolio.entrypoints=websecure"
-      - "traefik.http.routers.portfolio.tls=true"
-      - "traefik.http.routers.portfolio.tls.certresolver=le"
-      - "traefik.http.services.portfolio.loadbalancer.server.port=80"
-    restart: unless-stopped
-    networks:
-      - web
-
   chat-api:
     build: ./chat-api
-    depends_on:
-      - postgres
+    ports:
+      - "127.0.0.1:8000:8000"
     volumes:
       - chat-api-data:/app/data
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.chat-api.rule=Host(`api.aufaim.com`)"
-      - "traefik.http.routers.chat-api.entrypoints=websecure"
-      - "traefik.http.routers.chat-api.tls=true"
-      - "traefik.http.routers.chat-api.tls.certresolver=le"
-      - "traefik.http.services.chat-api.loadbalancer.server.port=8000"
+      - /mnt/data/projects/cerina/documents:/app/documents:ro
     environment:
-      # These environment variables are needed by the FastAPI app at runtime
-      - AUTH0_DOMAIN=${AUTH0_DOMAIN}
-      - API_AUDIENCE=${API_AUDIENCE}
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - GOOGLE_DRIVE_FOLDER_ID=${GOOGLE_DRIVE_FOLDER_ID}
-      - POSTGRES_DB=${POSTGRES_DB}
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - POSTGRES_HOST=${POSTGRES_HOST}
-      - POSTGRES_PORT=${POSTGRES_PORT}
+      - DATABASE_URL=${DATABASE_URL}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://ollama:11434/v1}
+      - CHAT_MODEL=${CHAT_MODEL:-qwen3.5:4b}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-qwen3-embedding:0.6b}
+      - LOCAL_SECRET_KEY=${LOCAL_SECRET_KEY}
+      - LOCAL_USERNAME=${LOCAL_USERNAME}
+      - LOCAL_PASSWORD=${LOCAL_PASSWORD}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-}
+    mem_limit: 1g
     restart: unless-stopped
     networks:
-      - web
+      - homelab
 
-  postgres:
-    image: pgvector/pgvector:pg16
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-    environment:
-      - POSTGRES_DB=${POSTGRES_DB}
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-    command: -c shared_buffers=64MB -c work_mem=2MB -c max_connections=20
+  portfolio-site:
+    build: ./portfolio-site
+    container_name: portfolio-site
     restart: unless-stopped
-    networks:
-      - web
+    mem_limit: 64m
+    ports:
+      - "127.0.0.1:8081:80"
+    networks: [homelab]
 
 volumes:
-  letsencrypt:
   chat-api-data:
-  postgres-data:
-
 
 networks:
-  web:
-    driver: bridge
+  homelab:
+    external: true
