@@ -1,0 +1,26 @@
+services:
+  ollama:
+    image: ollama/ollama
+    container_name: ollama
+    restart: unless-stopped
+    mem_limit: 6g
+    environment:
+      OLLAMA_KEEP_ALIVE: 5m
+      OLLAMA_MAX_LOADED_MODELS: "1"
+    volumes:
+      - /mnt/data/docker-volumes/ollama:/root/.ollama
+    ports:
+      - "127.0.0.1:11434:11434"
+    networks: [homelab]
+    # --- GPU passthrough (requires nvidia-container-toolkit on the host) ---
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+networks:
+  homelab:
+    external: true

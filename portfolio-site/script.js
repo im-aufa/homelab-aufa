@@ -22,22 +22,27 @@ document.addEventListener("DOMContentLoaded", async () => {
     errorEl.textContent = "";
 
     try {
+      console.log(`[LOGIN] Attempting login for username="${username}" → POST ${API_BASE}/login`);
       const res = await fetch(`${API_BASE}/login`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ username, password }),
       });
+      console.log(`[LOGIN] Response: HTTP ${res.status} ${res.statusText}`);
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
+        console.warn("[LOGIN] Failed:", data);
         throw new Error(data.detail || "Login failed");
       }
       const data = await res.json();
       accessToken = data.access_token;
       localStorage.setItem("cerince_token", accessToken);
       isAuthenticatedGlobal = true;
+      console.log("[LOGIN] Success — token stored in localStorage");
       closeLoginModal();
       updateUI(true);
     } catch (err) {
+      console.error("[LOGIN] Error:", err);
       errorEl.textContent = err.message;
     }
   });
@@ -256,6 +261,7 @@ async function sendMessage() {
   showTypingIndicator();
 
   try {
+    console.log(`[CHAT] Sending query → POST ${API_BASE}/chat`, { query, n_results: 5 });
     const response = await fetch(`${API_BASE}/chat`, {
       method: "POST",
       headers: {
@@ -265,9 +271,10 @@ async function sendMessage() {
       body: JSON.stringify({ query, n_results: 5 }),
     });
 
+    console.log(`[CHAT] Response: HTTP ${response.status} ${response.statusText}`);
     if (!response.ok) {
       const errorData = await response.json().catch(() => null);
-      // Token may have expired — clear session and prompt re-login
+      console.warn("[CHAT] Non-OK response body:", errorData);
       if (response.status === 401) {
         accessToken = null;
         isAuthenticatedGlobal = false;
@@ -278,15 +285,108 @@ async function sendMessage() {
       throw new Error(errorData?.detail || `HTTP ${response.status}`);
     }
 
-    const data = await response.json();
-    addMessage(data.response || "No response received.", false);
+    // --- Create the bot message bubble before the first token arrives ---
+    const messagesContainer = document.getElementById("chatMessages");
+    const messageWrapper = document.createElement("div");
+    messageWrapper.className = "message-wrapper bot";
+
+    const avatar = document.createElement("div");
+    avatar.className = "avatar";
+    avatar.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="8" width="18" height="12" rx="2"/><path d="M8 8V6a4 4 0 0 1 8 0v2"/><circle cx="12" cy="14" r="2"/></svg>`;
+
+    const messageContent = document.createElement("div");
+    messageContent.className = "message";
+
+    const textNode = document.createTextNode("");
+    messageContent.appendChild(textNode);
+
+    const timestamp = document.createElement("div");
+    timestamp.className = "timestamp";
+    timestamp.textContent = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    messageContent.appendChild(timestamp);
+
+    messageWrapper.appendChild(avatar);
+    messageWrapper.appendChild(messageContent);
+
+    // --- Consume the SSE stream ---
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let firstToken = true;
+    let tokenCount = 0;
+
+    console.log("[CHAT] SSE stream open — reading tokens ...");
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        console.log(`[CHAT] SSE stream closed by server (tokenCount=${tokenCount})`);
+        break;
+      }
+
+      buffer += decoder.decode(value, { stream: true });
+
+      // SSE lines: "data: {...}\n\n"
+      const lines = buffer.split("\n\n");
+      buffer = lines.pop(); // keep any incomplete tail
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith("data:")) continue;
+
+        let payload;
+        try {
+          payload = JSON.parse(trimmed.slice(5).trim());
+        } catch {
+          console.warn("[CHAT] Could not parse SSE line:", trimmed);
+          continue;
+        }
+
+        if (payload.error) {
+          console.error("[CHAT] Server sent error payload:", payload.error);
+          // Replace any streamed content with the error message
+          textNode.textContent = `Error: ${payload.error}`;
+          break;
+        }
+
+        if (payload.done) {
+          console.log(`[CHAT] SSE done signal received (tokenCount=${tokenCount})`);
+          break;
+        }
+
+        if (payload.token) {
+          tokenCount++;
+          if (firstToken) {
+            // Remove typing indicator and mount the bubble on first real token
+            console.log("[CHAT] First token received — displaying bot bubble");
+            hideTypingIndicator();
+            messagesContainer.appendChild(messageWrapper);
+            firstToken = false;
+          }
+          if (tokenCount % 10 === 0) {
+            console.debug(`[CHAT] Streaming... tokenCount=${tokenCount}`);
+          }
+          textNode.textContent += payload.token;
+          messagesContainer.scrollTop = messagesContainer.scrollHeight;
+        }
+      }
+    }
+
+    // If no tokens ever arrived, show a fallback message
+    if (firstToken) {
+      console.warn("[CHAT] No tokens received from SSE stream — showing fallback");
+      hideTypingIndicator();
+      addMessage("No response received.", false);
+    }
+
   } catch (error) {
     const friendly = error && typeof error.message === "string" ? error.message : "Unexpected error";
+    console.error("[CHAT] Fetch/stream error:", error);
     addMessage(`Error: ${friendly}. Please try again later.`, false);
     console.error("Fetch Error:", error);
   } finally {
     if (spinner) spinner.style.display = "none";
-    hideTypingIndicator();
+    hideTypingIndicator(); // safe no-op if already removed
     input.disabled = false;
     input.focus();
     isProcessingMessage = false;

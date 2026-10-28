@@ -9,13 +9,14 @@ services:
     environment:
       - DATABASE_URL=${DATABASE_URL}
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://ollama:11434/v1}
+      - OLLAMA_MAX_LOADED_MODELS=2
       - CHAT_MODEL=${CHAT_MODEL:-qwen3.5:4b}
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-qwen3-embedding:0.6b}
       - LOCAL_SECRET_KEY=${LOCAL_SECRET_KEY}
       - LOCAL_USERNAME=${LOCAL_USERNAME}
       - LOCAL_PASSWORD=${LOCAL_PASSWORD}
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-}
-    mem_limit: 1g
+    mem_limit: 2g
     restart: unless-stopped
     networks:
       - homelab

@@ -16,6 +16,7 @@ LOCAL_DIR="$(cd "$(dirname "$0")" && pwd)"
 echo "🔄 Syncing files to homelab..."
 rsync -avz --progress \
     --exclude '.git' \
+    --exclude '.env' \
     --exclude 'traefik/acme.json' \
     --exclude '__pycache__' \
     --exclude '*.pyc' \

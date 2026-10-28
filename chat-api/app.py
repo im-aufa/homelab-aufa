@@ -8,10 +8,14 @@ import glob
 from docling.chunking import HybridChunker
 from docling.document_converter import DocumentConverter
 from dotenv import load_dotenv
-from openai import OpenAI
+import asyncio
+import httpx
+from openai import OpenAI, AsyncOpenAI
 import psycopg2
 from psycopg2.extras import execute_values
+import json
 from fastapi import FastAPI, HTTPException, Depends
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from auth import get_current_user, create_token, LOCAL_USERNAME, LOCAL_PASSWORD
@@ -20,19 +24,40 @@ from auth import get_current_user, create_token, LOCAL_USERNAME, LOCAL_PASSWORD
 load_dotenv()
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[logging.StreamHandler()]  # stdout only — no file logging in local dev
 )
 logger = logging.getLogger(__name__)
+
+# Silence overly verbose third-party loggers so our logs stay readable
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("openai").setLevel(logging.WARNING)
+logging.getLogger("docling").setLevel(logging.WARNING)
 
 # --- Ollama / Model Configuration ---
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434/v1")
 CHAT_MODEL      = os.getenv("CHAT_MODEL",      "qwen3.5:4b")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "qwen3-embedding:0.6b")
 
-# OpenAI SDK pointed at Ollama; api_key must be non-empty but is otherwise ignored by Ollama.
+logger.info(f"[CONFIG] OLLAMA_BASE_URL={OLLAMA_BASE_URL}")
+logger.info(f"[CONFIG] CHAT_MODEL={CHAT_MODEL}")
+logger.info(f"[CONFIG] EMBEDDING_MODEL={EMBEDDING_MODEL}")
+
+# Ollama native API base (strips /v1 suffix if present) — used for think: false support.
+OLLAMA_NATIVE_URL = OLLAMA_BASE_URL.rstrip("/").removesuffix("/v1").removesuffix("/v1/")
+logger.info(f"[CONFIG] OLLAMA_NATIVE_URL={OLLAMA_NATIVE_URL}")
+
+# Sync client — used by background ingestion thread (can't await there).
 client = OpenAI(api_key="ollama", base_url=OLLAMA_BASE_URL)
+
+# Async client — used by chat endpoint so LLM calls don't block the event loop.
+async_client = AsyncOpenAI(api_key="ollama", base_url=OLLAMA_BASE_URL)
+
+# Cosine distance threshold for RAG retrieval.
+# Chunks with distance > this value are considered irrelevant and filtered out.
+SIMILARITY_THRESHOLD = 0.50
 
 # Chunk size for document ingestion (tokens, via HybridChunker's internal bert tokenizer).
 CHUNK_MAX_TOKENS = 512
@@ -46,6 +71,7 @@ app = FastAPI(title="Cerina RAG API")
 # CORS: comma-separated allowed origins. Leave ALLOWED_ORIGINS blank to disallow all cross-origin requests.
 _raw_origins  = os.getenv("ALLOWED_ORIGINS", "")
 allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+logger.info(f"[CONFIG] ALLOWED_ORIGINS={allowed_origins or '(none — cross-origin requests blocked)'}")
 
 app.add_middleware(
     CORSMiddleware,
@@ -132,25 +158,30 @@ def embed_documents(texts: List[str]) -> List[List[float]]:
     """Embed document chunks as plain text (no prefix). Used at ingestion time."""
     if not texts:
         return []
+    logger.debug(f"[EMBED] embed_documents: sending {len(texts)} text(s) to Ollama ({EMBEDDING_MODEL})")
     try:
         response = client.embeddings.create(model=EMBEDDING_MODEL, input=texts)
+        logger.debug(f"[EMBED] embed_documents: received {len(response.data)} embedding(s)")
         return [e.embedding for e in response.data]
     except Exception as e:
-        logger.error(f"Error embedding documents: {e}")
+        logger.error(f"[EMBED] embed_documents failed: {type(e).__name__}: {e}")
         raise
 
-def embed_query(query: str) -> List[float]:
+async def embed_query(query: str) -> List[float]:
     """Embed a user query with the required task instruction prefix. Used at search time."""
     prefixed = (
         "Instruct: Given a web search query, retrieve relevant passages that answer the query\n"
         f"Query: {query}"
     )
+    logger.debug(f"[EMBED] embed_query: sending query to Ollama ({EMBEDDING_MODEL}), len={len(query)}")
     try:
-        response = client.embeddings.create(model=EMBEDDING_MODEL, input=[prefixed])
+        response = await async_client.embeddings.create(model=EMBEDDING_MODEL, input=[prefixed])
+        logger.debug(f"[EMBED] embed_query: embedding received, dim={len(response.data[0].embedding)}")
         return response.data[0].embedding
     except Exception as e:
-        logger.error(f"Error embedding query: {e}")
+        logger.error(f"[EMBED] embed_query failed: {type(e).__name__}: {e}")
         raise
+
 
 # --- Chunk Storage ---
 def store_chunks(chunks_data: List[tuple]):
@@ -263,83 +294,166 @@ def process_documents(local_folder_path: str, job_id: str):
     logger.info(f"[{job_id}] Ingestion complete. {job['done']} processed, {job['failed']} failed.")
 
 # --- RAG Search & Query ---
-def search_chunks(query: str, n_results: int = 5) -> List[dict]:
-    conn = None
+async def search_chunks(query: str, n_results: int = 5) -> List[dict]:
+    """Embed the query and retrieve the top-N chunks above the similarity threshold."""
+    logger.info(f"[RAG] search_chunks: query='{query[:80]}{'...' if len(query) > 80 else ''}', n_results={n_results}")
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        query_embedding = embed_query(query)
-        cursor.execute("""
-            SELECT doc_id, doc_name, chunk_index, text, filename, page_numbers, title, source_type,
-                   (embedding <=> %s::vector) as distance
-            FROM chunks
-            ORDER BY distance ASC
-            LIMIT %s
-        """, (query_embedding, n_results))
-        results = [
-            {
-                "doc_id": row[0], "doc_name": row[1], "chunk_index": row[2],
-                "text": row[3], "filename": row[4], "page_numbers": row[5],
-                "title": row[6], "source_type": row[7], "distance": row[8]
-            }
-            for row in cursor.fetchall()
-        ]
-        return results
-    except psycopg2.Error as e:
-        logger.error(f"Database error during chunk search: {e}")
-        return []
-    finally:
-        if conn:
-            cursor.close()
-            conn.close()
+        query_embedding = await embed_query(query)
+    except Exception:
+        logger.error("[RAG] search_chunks: embed_query failed — returning empty results")
+        return []  # embed_query already logged the error
 
-def query_rag(query: str, n_results: int = 5) -> str:
+    def _db_search():
+        conn = None
+        try:
+            conn = get_connection()
+            logger.debug("[RAG] _db_search: DB connection established")
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT doc_id, doc_name, chunk_index, text, filename, page_numbers, title, source_type,
+                       (embedding <=> %s::vector) as distance
+                FROM chunks
+                ORDER BY distance ASC
+                LIMIT %s
+            """, (query_embedding, n_results))
+            rows = cursor.fetchall()
+            logger.debug(f"[RAG] _db_search: {len(rows)} row(s) returned before threshold filter")
+            filtered = [
+                {
+                    "doc_id": row[0], "doc_name": row[1], "chunk_index": row[2],
+                    "text": row[3], "filename": row[4], "page_numbers": row[5],
+                    "title": row[6], "source_type": row[7], "distance": row[8]
+                }
+                for row in rows
+                if row[8] <= SIMILARITY_THRESHOLD  # filter irrelevant chunks
+            ]
+            if rows:
+                distances = [round(row[8], 4) for row in rows]
+                logger.debug(f"[RAG] _db_search: distances={distances}, threshold={SIMILARITY_THRESHOLD}")
+            logger.info(f"[RAG] _db_search: {len(filtered)} chunk(s) passed similarity threshold")
+            return filtered
+        except psycopg2.Error as e:
+            logger.error(f"[RAG] _db_search: DB error: {type(e).__name__}: {e}")
+            return []
+        finally:
+            if conn:
+                cursor.close()
+                conn.close()
+
+    return await asyncio.to_thread(_db_search)
+
+
+async def stream_rag(query: str, n_results: int = 5):
+    """
+    Async generator that yields Server-Sent Events (SSE) for each token
+    produced by the LLM.  Format:
+        data: {"token": "…"}\n\n   — for each streamed token chunk
+        data: {"done": true}\n\n  — once the stream finishes
+        data: {"error": "…"}\n\n  — on failure
+    """
+    logger.info(f"[STREAM] stream_rag: START — query='{query[:80]}{'...' if len(query) > 80 else ''}'")
     try:
-        relevant_chunks = search_chunks(query, n_results)
-        if not relevant_chunks:
-            return (
-                "I'm Cerina, and I'm here to help! I wasn't able to find anything in the documents "
-                "that directly answers your question. Feel free to ask something else — I'll do my best."
+        relevant_chunks = await search_chunks(query, n_results)
+
+        if relevant_chunks:
+            context_parts = []
+            for res in relevant_chunks:
+                source_parts = []
+                if res.get("doc_name"):
+                    source_parts.append(f"Document: '{res['doc_name']}'")
+                if res.get("page_numbers"):
+                    source_parts.append(f"Pages: {', '.join(map(str, res['page_numbers']))}")
+                if res.get("title"):
+                    source_parts.append(f"Section: '{res['title']}'")
+                source_info = " | ".join(filter(None, source_parts))
+                context_parts.append(f"[{source_info}]\n{res['text']}\n---")
+            context_str = "\n\n".join(context_parts)
+
+            system_message = (
+                "You are Cerina, a warm and caring health companion specialising in menstrual health "
+                "and cervical wellness. Relevant document excerpts are provided below.\n\n"
+                "Use those excerpts as your primary source. You may supplement with your general medical "
+                "knowledge to give a complete answer, but always make clear when you're drawing on the "
+                "documents vs. general knowledge. Cite the document name and page when helpful.\n\n"
+                "Be warm, human, and approachable — never clinical or cold."
             )
-        context = []
-        for res in relevant_chunks:
-            source_parts = []
-            if res.get("doc_name"):
-                source_parts.append(f"Document: '{res['doc_name']}' ({res.get('source_type', 'unknown')})")
-            if res.get("page_numbers"):
-                source_parts.append(f"Pages: {', '.join(map(str, res['page_numbers']))}")
-            if res.get("title"):
-                source_parts.append(f"Section: '{res['title']}'")
-            source_info = " | ".join(filter(None, source_parts))
-            context.append(f"Context from {source_info}:\n{res['text']}\n---")
-        context_str = "\n\n".join(context)
+            user_message = f"{query}\n\nRelevant document excerpts:\n{context_str}"
+            logger.info(f"[STREAM] Responding with {len(relevant_chunks)} relevant chunk(s).")
+        else:
+            system_message = (
+                "You are Cerina, a warm and caring health companion specialising in menstrual health "
+                "and cervical wellness. No specific documents were found for this question.\n\n"
+                "Answer using your general knowledge. Be honest about uncertainty. For greetings or "
+                "off-topic messages, respond naturally and warmly — you don't have to stay on-topic "
+                "for every single message.\n\n"
+                "Be warm, human, and approachable — never clinical or cold."
+            )
+            user_message = query
+            logger.info("No relevant chunks found — using general knowledge.")
 
-        # DRAFT system prompt — review tone/scope in docs/decisions/local-embeddings.md before going live.
-        system_message = (
-            "You are Cerina, a warm and caring health companion. You're here to help people understand "
-            "their bodies with kindness, clarity, and honesty — especially around menstrual health and cervical wellness.\n\n"
-            "Answer questions based only on the information provided in the context below. If the context "
-            "doesn't cover something clearly, say so gently — never guess or fill in gaps with assumptions. "
-            "When you have useful information, mention where it comes from (document name, page, or section) "
-            "so the person can explore further if they'd like.\n\n"
-            "Be warm, human, and approachable. Avoid clinical distance. You're talking with a real person "
-            "who deserves a thoughtful, caring answer."
-        )
-
-        response = client.chat.completions.create(
-            model=CHAT_MODEL,
-            messages=[
+        # Use Ollama's native /api/chat endpoint directly — the only reliable way to
+        # pass think: false across all Ollama versions. The OpenAI-compat layer silently
+        # swallows thinking tokens and ignores extra_body think flags on older builds.
+        ollama_url = f"{OLLAMA_NATIVE_URL}/api/chat"
+        payload = {
+            "model": CHAT_MODEL,
+            "messages": [
                 {"role": "system", "content": system_message},
-                {"role": "user",   "content": f"User Question: {query}\n\nProvided Context:\n{context_str}"}
+                {"role": "user",   "content": user_message},
             ],
-            max_tokens=700,
-            temperature=0.7,
-            extra_body={"think": False}  # Disable qwen3 thinking/reasoning mode — avoids ~3 min latency per response
-        )
-        return response.choices[0].message.content
+            "think": False,
+            "stream": True,
+            "options": {
+                "num_predict": 1024,
+                "temperature": 0.7,
+            },
+        }
+        logger.info(f"[STREAM] Calling Ollama native API → POST {ollama_url} (think=false, num_predict=1024)")
+
+        token_count = 0
+        thinking_token_count = 0
+        async with httpx.AsyncClient(timeout=300.0) as http:
+            async with http.stream("POST", ollama_url, json=payload) as resp:
+                if resp.status_code != 200:
+                    body = await resp.aread()
+                    logger.error(f"[STREAM] Ollama returned HTTP {resp.status_code}: {body.decode()[:200]}")
+                    yield f"data: {json.dumps({'error': f'Ollama error {resp.status_code}'})}\n\n"
+                    return
+
+                logger.debug("[STREAM] Ollama stream opened — reading tokens ...")
+                async for raw_line in resp.aiter_lines():
+                    if not raw_line:
+                        continue
+                    try:
+                        data = json.loads(raw_line)
+                    except json.JSONDecodeError:
+                        logger.warning(f"[STREAM] Could not parse line: {raw_line[:100]}")
+                        continue
+
+                    # Log thinking tokens separately (they appear in data["thinking"])
+                    thinking = data.get("thinking") or ""
+                    if thinking:
+                        thinking_token_count += len(thinking)
+                        logger.debug(f"[STREAM] Thinking chunk, cumulative thinking chars={thinking_token_count}")
+
+                    content = (data.get("message") or {}).get("content") or ""
+                    if content:
+                        token_count += 1
+                        yield f"data: {json.dumps({'token': content})}\n\n"
+
+                    if data.get("done"):
+                        stats = {k: data.get(k) for k in ("total_duration", "eval_count", "prompt_eval_count") if k in data}
+                        logger.info(f"[STREAM] Ollama done signal. tokens_sent={token_count}, thinking_chars={thinking_token_count}, stats={stats}")
+                        break
+
+        logger.info(f"[STREAM] stream_rag: DONE — {token_count} token chunk(s) sent")
+        yield f"data: {json.dumps({'done': True})}\n\n"
+
+
     except Exception as e:
-        logger.error(f"Error querying RAG: {e}")
-        return "I'm Cerina, your health companion. Something went wrong on my end — please try again in a moment."
+        logger.error(f"[STREAM] stream_rag: UNHANDLED ERROR — {type(e).__name__}: {e}", exc_info=True)
+        yield f"data: {json.dumps({'error': 'Something went wrong on my end — please try again in a moment.'})}\n\n"
+
 
 # --- Pydantic Models ---
 class LoginRequest(BaseModel):
@@ -387,16 +501,25 @@ async def root():
 @app.post("/login", response_model=LoginResponse)
 async def login(request: LoginRequest):
     """Simple local login — returns a signed token on correct credentials."""
+    logger.info(f"[LOGIN] Attempt for username='{request.username}'")
     if request.username != LOCAL_USERNAME or request.password != LOCAL_PASSWORD:
+        logger.warning(f"[LOGIN] FAILED for username='{request.username}' — invalid credentials")
         raise HTTPException(status_code=401, detail="Invalid username or password")
     token = create_token(request.username)
+    logger.info(f"[LOGIN] SUCCESS for username='{request.username}'")
     return LoginResponse(access_token=token)
 
-@app.post("/chat", response_model=QueryResponse)
+@app.post("/chat")
 async def chat_endpoint(request: QueryRequest, user: dict = Depends(get_current_user)):
-    logger.info(f"Received query from '{user.get('sub')}': '{request.query}'")
-    response_text = query_rag(request.query, request.n_results)
-    return QueryResponse(response=response_text)
+    logger.info(f"[CHAT] Received query from user='{user.get('sub')}': '{request.query[:80]}{'...' if len(request.query) > 80 else ''}'")
+    return StreamingResponse(
+        stream_rag(request.query, request.n_results),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # disable nginx buffering if behind a proxy
+        },
+    )
 
 @app.post("/process", response_model=ProcessResponse)
 async def process_endpoint(request: ProcessRequest, user: dict = Depends(get_current_user)):
@@ -434,6 +557,31 @@ async def process_status_endpoint(job_id: str, user: dict = Depends(get_current_
     return ProcessStatusResponse(job_id=job_id, **job)
 
 # --- Startup ---
+async def _warmup_models():
+    """Pre-load both Ollama models so the first user request doesn't cold-start timeout."""
+    logger.info("Warming up Ollama models in background...")
+    try:
+        await async_client.embeddings.create(model=EMBEDDING_MODEL, input=["warmup"])
+        logger.info(f"✅ Embedding model '{EMBEDDING_MODEL}' warmed up.")
+    except Exception as e:
+        logger.warning(f"Embedding warmup failed (non-fatal): {e}")
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as http:
+            r = await http.post(
+                f"{OLLAMA_NATIVE_URL}/api/chat",
+                json={
+                    "model": CHAT_MODEL,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "think": False,
+                    "stream": False,
+                    "options": {"num_predict": 5},
+                },
+            )
+            r.raise_for_status()
+        logger.info(f"✅ Chat model '{CHAT_MODEL}' warmed up.")
+    except Exception as e:
+        logger.warning(f"Chat model warmup failed (non-fatal): {e}")
+
 @app.on_event("startup")
 async def startup_event():
     logger.info("Application startup...")
@@ -442,3 +590,5 @@ async def startup_event():
         logger.info("PostgreSQL connection verified.")
     except Exception as e:
         logger.error(f"Failed to initialize PostgreSQL: {e}")
+    # Warm up Ollama models in background — doesn't block startup
+    asyncio.create_task(_warmup_models())
